@@ -1,0 +1,6 @@
+store_id,store_name,city,district_id,district_name,region,store_type,open_date
+S001,Central Plaza,Springfield,D01,North,Central,Supercenter,2015-03-01
+S002,Riverside,Riverton,D02,East,Central,Neighborhood,2017-06-15
+S003,Hilltop,Highview,D03,West,Central,Supercenter,2018-09-10
+S004,Lakeside,Springfield,D01,North,Central,Neighborhood,2019-04-22
+S005,Harbor Point,Portside,D04,South,Central,Express,2021-01-30

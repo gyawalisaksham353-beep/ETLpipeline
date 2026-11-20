@@ -1,0 +1,11 @@
+item_id,item_name,brand,category,subclass_id,subclass_name,unit_cost,list_price
+I001,Whole Milk 1L,FreshFarm,Dairy,SC01,Milk,0.90,1.50
+I002,Cheddar Cheese 200g,FreshFarm,Dairy,SC02,Cheese,2.10,3.50
+I003,Greek Yogurt 500g,DairyBest Select,Dairy,SC11,Yogurt,1.40,2.40
+I004,Sourdough Loaf,BakeHouse,Bakery,SC03,Bread,1.80,3.20
+I005,Croissant 4pk,BakeHouse,Bakery,SC03,Bread,2.00,3.80
+I006,Orange Juice 1L,SunPress,Beverages,SC05,Juice,1.60,2.90
+I007,Sparkling Water 6pk,AquaPure,Beverages,SC06,Water,2.20,3.90
+I008,Basmati Rice 5kg,GrainCo,Grocery,SC07,Rice,7.50,12.00
+I009,Pasta 500g,GrainCo,Grocery,SC08,Pasta,0.80,1.60
+I010,Dish Soap 500ml,CleanCo,Household,SC09,Cleaning,1.10,2.50
