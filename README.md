@@ -354,6 +354,9 @@ All recorded counts and measures should remain identical.
 
 Mocked unit tests alone are not sufficient to establish live Snowflake replay correctness.
 
+
+
+
 ## 10. Live Execution Results
 
 The pipeline was executed against the configured Snowflake account on **November 20, 2026**.
@@ -403,7 +406,7 @@ Quarantine breakdown:
 ```text
 .
 ├── dags/
-│   ├── retail_warehouse_pipeline.py
+│   ├── retail_pipeline.py
 │   └── utils/
 ├── include/
 │   └── sql/
@@ -417,57 +420,110 @@ Quarantine breakdown:
 │   ├── source_contract.md
 │   └── silver_contract.md
 ├── evidence/
-│   ├── backfill_grid.svg
-│   ├── backfill_grid.html
-│   ├── backfill_runs.txt
-│   ├── reconciliation_output.txt
-│   └── idempotency snapshots
+│   ├── Backfill_Sucess.png
+│   ├── 2nd_DagRun.png
+│   ├── Reconcilation.png
+│   ├── Qurantine_Value.png
+│   └── Verfication of testcases.png
 ├── data/
 ├── docker-compose.yaml
 └── README.md
 ```
 
-## 12. Documentation and Evidence
+## 12. Evidence
 
-Additional documentation:
+The `evidence/` folder contains point-in-time screenshots from the Airflow UI
+and Snowflake query results:
 
-| File | Description |
+| Screenshot | What it demonstrates |
 |---|---|
-| `docs/source_contract.md` | Source columns, observed types, grains, and business keys. |
-| `docs/silver_contract.md` | Silver-layer data types and validation rules. |
-| `include/sql/test/verify_five_defects.sql` | Defect, SCD, and inventory verification queries. |
-| `include/sql/recon/pipeline_summary.sql` | Latest reconciliation summary. |
+| `Backfill_Sucess.png` | The five logical-date backfill runs for November 10–14 completed successfully. |
+| `2nd_DagRun.png` | Gold audit rows for a baseline run and a second run; the visible row-count deltas are zero. |
+| `Reconcilation.png` | Reconciliation checks for November 12, including row counts, quarantined records, sales amounts, and Silver-to-Gold comparisons. |
+| `Qurantine_Value.png` | The four November 12 quarantined sales rows, their reason codes, and raw records. |
+| `Verfication of testcases.png` | The five deliberate defect cases: two null item IDs, one negative quantity, one orphan item, and one duplicate line; all displayed checks pass. |
 
-### Execution Evidence
+These screenshots are evidence of the displayed run and query results, not
+reproducible test fixtures. Rerun the DAG or the relevant SQL to verify the
+current Snowflake state. The audit screenshot visibly shows row-count deltas;
+to demonstrate that sales, quantity, and inventory totals are unchanged, run
+the Gold audit query in Section 9 and include those delta columns in the
+captured result.
 
-The `evidence/` directory contains:
+### Related documentation and SQL
 
-- `backfill_grid.svg` and `backfill_grid.html`: Visual representation of Airflow task execution.
-- `backfill_runs.txt`: Raw Airflow run states.
-- `reconciliation_output.txt`: Reconciliation and defect verification output.
-- Before-and-after idempotency snapshots.
-
-The SVG grid was generated from Airflow task states because the execution environment did not have a browser screenshot tool. Raw run states and Snowflake outputs are included alongside it.
+- `docs/source_contract.md`: observed source columns, types, grains, and keys.
+- `docs/silver_contract.md`: Silver fields and validation rules.
+- `include/sql/test/verify_five_defects.sql`: defect, SCD, and inventory checks.
+- `include/sql/recon/pipeline_summary.sql`: reconciliation summary query.
 
 ## 13. Known Limitations
 
-The following limitations were identified during implementation:
+The following limitations should be considered when operating or extending
+the pipeline:
 
-1. **Existing Airflow DAG issue:** The environment's `example_custom_weight` DAG can break the global `airflow dags list` command because its custom priority-weight strategy is not registered. The retail pipeline and its per-DAG commands are unaffected.
+1. **Sequential Gold loading:** Gold dimensions and facts run in sequence.
+   Some independent dimension loads could potentially run in parallel, but the
+   current ordering keeps surrogate-key dependencies straightforward.
 
-2. **Typed Bronze sales table:** `BRONZE_SALES` uses `DATE` and `NUMBER` columns instead of storing every field as `VARCHAR`. The supplied defects are handled, but future files containing unparseable dates or numeric values would require a Bronze schema rebuild or a text-based staging model.
+2. **Existing Bronze schema drift:** The Bronze DDL defines source fields as
+   text, but `CREATE TABLE IF NOT EXISTS` does not change an already-created
+   table. An installation with an older typed `BRONZE_SALES` schema may still
+   have `DATE`/`NUMBER` columns. Check the live table definition before
+   changing casts or loading files with malformed values.
 
-3. **Quarantine rebuild scope:** Quarantine rebuilding replaces rows per source across all Bronze history rather than only the logical-date partition. It is idempotent but becomes more expensive as historical data grows.
+3. **Quarantine rebuild scope:** Silver transformations rebuild quarantine
+   rows per source across the available Bronze history, not only the current
+   logical-date partition. This is idempotent but becomes more expensive as
+   history grows.
 
-4. **Corrected source-file deletions:** Gold fact tables use `MERGE` on their grain keys. If a corrected source file removes an existing transaction line, the old Gold record is not automatically deleted.
+4. **Corrected source-file deletions:** Gold fact tables use `MERGE` on their
+   grain keys. If a corrected source file removes a transaction line, the old
+   Gold row is not automatically deleted.
 
-5. **Legacy ingestion records:** Legacy `INGEST_BATCH` rows are ignored during date-scoped reconciliation rather than deleted.
+5. **Reconciliation history:** `CONTROL.RECONCILIATION` is rebuilt by layer
+   boundary. It is intended to show the current reconciliation results, not
+   provide a durable history of every DAG run. `CONTROL.GOLD_RUN_AUDIT`
+   provides run history for selected Gold counts and measures.
 
-6. **Legacy Gold schema:** Tables from the earlier modeling exercise use different key names (`ITEM_KY`, `LOCN_KY`, `DAY_KY`) and cannot be upgraded additively due to their `NOT NULL` constraints. The pipeline detects these markers and drops only pipeline-owned Gold tables once with `CASCADE`, then recreates them. Silver remains the source of truth for rebuilding Gold.
+6. **Gold audit execution point:** The Gold audit runs after Gold
+   reconciliation and verification. A DAG run that is still waiting for files
+   or fails before reaching that task will not have a Gold metrics audit row.
 
-7. **Missing source files:** All four source prefixes must be present for the logical date. A missing file causes the sensor to time out.
+7. **Audit comparison scope:** `GOLD_RUN_AUDIT` compares selected table counts
+   and aggregate measures. An `UNCHANGED` status means those recorded metrics
+   match; it is not a row-by-row or full-table content comparison.
 
-8. **Insert-count mismatch:** A failing mapped loader rolls back its transaction and reports the affected file and batch ID. The failing loader should be investigated before retrying reconciliation.
+8. **Operational alerting and query attribution:** External failure alerts
+   and Snowflake query tags are not configured. Operators should use Airflow
+   task states/logs and Snowflake query history when investigating failures.
+
+9. **Regression-test date scope:** `include/sql/test/verify_five_defects.sql`
+   checks invariants over the loaded data and is not restricted to one
+   processing date. Use a date-scoped query when presenting evidence for a
+   specific backfill day.
+
+10. **Missing source files:** The sensor requires all four feeds for the
+    logical date and times out after ten minutes. With `catchup=False`, missed
+    dates require an explicit backfill or manual run.
+
+11. **Unrelated example DAG:** In this environment, the `example_custom_weight`
+    DAG can cause the global `airflow dags list` command to fail when its
+    custom priority-weight strategy is not registered. This does not prevent
+    running the retail DAG directly.
+
+12. **Legacy ingestion batches:** Legacy `INGEST_BATCH` records are ignored
+    during date-scoped reconciliation rather than deleted.
+
+13. **Legacy Gold schema migration:** Older Gold tables can use incompatible
+    key names and constraints. The pipeline detects the legacy schema and
+    replaces the pipeline-owned Gold tables with the current model; review
+    existing Gold data before running that migration.
+
+14. **Bronze insert-count mismatch:** A mapped loader reports the affected
+    file and batch if staged and inserted row counts differ. Investigate that
+    loader before retrying downstream reconciliation.
+
 
 ---
 
