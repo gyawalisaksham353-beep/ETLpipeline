@@ -1,0 +1,155 @@
+-- =====================================================
+-- SILVER INVENTORY TRANSFORMATION
+-- Bronze -> validate -> quarantine rejects -> merge valid
+-- Business key: SNAPSHOT_DATE + ITEM_ID + STORE_ID
+-- =====================================================
+
+DELETE FROM {{ snowflake_database }}.QUARANTINE.RECORD_QUARANTINE
+WHERE SOURCE_NAME = 'inventory'
+  AND SOURCE_LAYER = 'BRONZE';
+
+INSERT INTO {{ snowflake_database }}.QUARANTINE.RECORD_QUARANTINE (
+    BATCH_ID,
+    SOURCE_NAME,
+    SOURCE_LAYER,
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    RAW_RECORD,
+    REASON_CODE,
+    REJECTION_REASON,
+    LOAD_DATE,
+    INGEST_TS,
+    QUARANTINE_TS
+)
+SELECT
+    BATCH_ID,
+    'inventory',
+    'BRONZE',
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    OBJECT_CONSTRUCT(
+        'snapshot_date', SNAPSHOT_DATE,
+        'item_id', ITEM_ID,
+        'store_id', STORE_ID,
+        'on_hand_qty', ON_HAND_QTY,
+        'unit_cost', UNIT_COST
+    ),
+    CASE
+        WHEN TRY_TO_DATE(SNAPSHOT_DATE) IS NULL THEN 'INVALID_SNAPSHOT_DATE'
+        WHEN COALESCE(TRIM(ITEM_ID), '') = '' THEN 'MISSING_ITEM_ID'
+        WHEN COALESCE(TRIM(STORE_ID), '') = '' THEN 'MISSING_STORE_ID'
+        WHEN TRY_TO_NUMBER(ON_HAND_QTY, 38, 6) IS NULL THEN 'INVALID_ON_HAND_QTY'
+        WHEN TRY_TO_NUMBER(ON_HAND_QTY, 38, 6) < 0 THEN 'NEGATIVE_ON_HAND_QTY'
+        WHEN TRY_TO_NUMBER(UNIT_COST, 38, 6) IS NULL THEN 'INVALID_UNIT_COST'
+        WHEN TRY_TO_NUMBER(UNIT_COST, 38, 6) < 0 THEN 'NEGATIVE_UNIT_COST'
+        ELSE 'INVALID_INVENTORY_ROW'
+    END,
+    RTRIM(CONCAT(
+        IFF(TRY_TO_DATE(SNAPSHOT_DATE) IS NULL, 'invalid snapshot date; ', ''),
+        IFF(COALESCE(TRIM(ITEM_ID), '') = '', 'missing item id; ', ''),
+        IFF(COALESCE(TRIM(STORE_ID), '') = '', 'missing store id; ', ''),
+        IFF(TRY_TO_NUMBER(ON_HAND_QTY, 38, 6) IS NULL, 'invalid on-hand quantity; ', ''),
+        IFF(TRY_TO_NUMBER(ON_HAND_QTY, 38, 6) < 0, 'negative on-hand quantity; ', ''),
+        IFF(TRY_TO_NUMBER(UNIT_COST, 38, 6) IS NULL, 'invalid unit cost; ', ''),
+        IFF(TRY_TO_NUMBER(UNIT_COST, 38, 6) < 0, 'negative unit cost; ', '')
+    ), '; '),
+    COALESCE(
+        TRY_TO_DATE(REGEXP_SUBSTR(SRC_FILE_NM, '[0-9]{8}'), 'YYYYMMDD'),
+        INGEST_DT
+    ),
+    INGEST_TS,
+    CURRENT_TIMESTAMP()
+FROM {{ snowflake_database }}.BRONZE.BRONZE_INVENTORY
+WHERE NOT (
+    TRY_TO_DATE(SNAPSHOT_DATE) IS NOT NULL
+    AND COALESCE(TRIM(ITEM_ID), '') <> ''
+    AND COALESCE(TRIM(STORE_ID), '') <> ''
+    AND TRY_TO_NUMBER(ON_HAND_QTY, 38, 6) >= 0
+    AND TRY_TO_NUMBER(UNIT_COST, 38, 6) >= 0
+);
+
+-- Refresh silver from the current validated bronze contents.
+DELETE FROM {{ snowflake_database }}.SILVER.SILVER_INVENTORY
+WHERE SNAPSHOT_DATE = TO_DATE(%s);
+
+MERGE INTO {{ snowflake_database }}.SILVER.SILVER_INVENTORY AS TARGET
+USING (
+    WITH CASTED AS (
+        SELECT
+            TRY_TO_DATE(SNAPSHOT_DATE) AS SNAPSHOT_DATE,
+            ITEM_ID,
+            STORE_ID,
+            TRY_TO_NUMBER(ON_HAND_QTY, 14, 2) AS ON_HAND_QTY,
+            TRY_TO_NUMBER(UNIT_COST, 12, 2) AS UNIT_COST,
+            SRC_FILE_NM,
+            SRC_ROW_NUM,
+            INGEST_TS,
+            BATCH_ID
+        FROM {{ snowflake_database }}.BRONZE.BRONZE_INVENTORY
+        WHERE
+            TRY_TO_DATE(SNAPSHOT_DATE) = TO_DATE(%s)
+            AND
+            TRY_TO_DATE(SNAPSHOT_DATE) IS NOT NULL
+            AND COALESCE(TRIM(ITEM_ID), '') <> ''
+            AND COALESCE(TRIM(STORE_ID), '') <> ''
+            AND TRY_TO_NUMBER(ON_HAND_QTY, 38, 6) >= 0
+            AND TRY_TO_NUMBER(UNIT_COST, 38, 6) >= 0
+    )
+    SELECT
+        SNAPSHOT_DATE,
+        ITEM_ID,
+        STORE_ID,
+        ON_HAND_QTY,
+        UNIT_COST,
+        ON_HAND_QTY * UNIT_COST AS INVENTORY_VALUE,
+        SRC_FILE_NM,
+        SRC_ROW_NUM,
+        INGEST_TS,
+        BATCH_ID
+    FROM CASTED
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY SNAPSHOT_DATE, ITEM_ID, STORE_ID
+        ORDER BY INGEST_TS DESC, SRC_ROW_NUM DESC
+    ) = 1
+) AS SOURCE
+ON
+    TARGET.SNAPSHOT_DATE = SOURCE.SNAPSHOT_DATE
+    AND TARGET.ITEM_ID = SOURCE.ITEM_ID
+    AND TARGET.STORE_ID = SOURCE.STORE_ID
+
+WHEN MATCHED THEN UPDATE SET
+    TARGET.ON_HAND_QTY = SOURCE.ON_HAND_QTY,
+    TARGET.UNIT_COST = SOURCE.UNIT_COST,
+    TARGET.INVENTORY_VALUE = SOURCE.INVENTORY_VALUE,
+    TARGET.SRC_FILE_NM = SOURCE.SRC_FILE_NM,
+    TARGET.SRC_ROW_NUM = SOURCE.SRC_ROW_NUM,
+    TARGET.INGEST_TS = SOURCE.INGEST_TS,
+    TARGET.BATCH_ID = SOURCE.BATCH_ID,
+    TARGET.UPDATED_TS = CURRENT_TIMESTAMP()
+
+WHEN NOT MATCHED THEN INSERT (
+    SNAPSHOT_DATE,
+    ITEM_ID,
+    STORE_ID,
+    ON_HAND_QTY,
+    UNIT_COST,
+    INVENTORY_VALUE,
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    INGEST_TS,
+    BATCH_ID,
+    CREATED_TS
+)
+VALUES (
+    SOURCE.SNAPSHOT_DATE,
+    SOURCE.ITEM_ID,
+    SOURCE.STORE_ID,
+    SOURCE.ON_HAND_QTY,
+    SOURCE.UNIT_COST,
+    SOURCE.INVENTORY_VALUE,
+    SOURCE.SRC_FILE_NM,
+    SOURCE.SRC_ROW_NUM,
+    SOURCE.INGEST_TS,
+    SOURCE.BATCH_ID,
+    CURRENT_TIMESTAMP()
+);

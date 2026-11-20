@@ -1,0 +1,142 @@
+-- =====================================================
+-- SOURCE -> BRONZE RECONCILIATION
+-- Source Records = Loaded Records + File-Rejected Records
+-- =====================================================
+
+DELETE FROM {{ snowflake_database }}.CONTROL.RECONCILIATION
+WHERE SOURCE_LAYER = 'SOURCE'
+  AND TARGET_LAYER = 'BRONZE';
+
+INSERT INTO {{ snowflake_database }}.CONTROL.RECONCILIATION (
+    RECON_ID,
+    BATCH_ID,
+    SOURCE_NAME,
+    SOURCE_LAYER,
+    TARGET_LAYER,
+    SOURCE_RECORD_COUNT,
+    TARGET_RECORD_COUNT,
+    REJECTED_RECORD_COUNT,
+    DUPLICATE_RECORD_COUNT,
+    SOURCE_MEASURE_TOTAL,
+    TARGET_MEASURE_TOTAL,
+    RECON_STATUS,
+    RECON_MESSAGE,
+    RECON_TS
+)
+WITH BRONZE_COUNTS AS (
+    SELECT 'pos_sales' AS SOURCE_NAME, BATCH_ID, COUNT(*) AS CNT
+    FROM {{ snowflake_database }}.BRONZE.BRONZE_SALES
+    GROUP BY BATCH_ID
+
+    UNION ALL
+
+    SELECT 'item_master' AS SOURCE_NAME, BATCH_ID, COUNT(*) AS CNT
+    FROM {{ snowflake_database }}.BRONZE.BRONZE_ITEM_MASTER
+    GROUP BY BATCH_ID
+
+    UNION ALL
+
+    SELECT 'inventory' AS SOURCE_NAME, BATCH_ID, COUNT(*) AS CNT
+    FROM {{ snowflake_database }}.BRONZE.BRONZE_INVENTORY
+    GROUP BY BATCH_ID
+
+    UNION ALL
+
+    SELECT 'store_master' AS SOURCE_NAME, BATCH_ID, COUNT(*) AS CNT
+    FROM {{ snowflake_database }}.BRONZE.BRONZE_STORE_MASTER
+    GROUP BY BATCH_ID
+),
+DUPLICATE_BATCHES AS (
+    SELECT SRC_FILE_NM
+    FROM {{ snowflake_database }}.CONTROL.INGEST_BATCH
+    WHERE REGEXP_LIKE(
+        BATCH_ID,
+        '^[0-9]{8}_(pos_sales|item_master|inventory|store_master)_[0-9a-f]{16}$'
+    )
+    GROUP BY SRC_FILE_NM
+    HAVING COUNT(DISTINCT BATCH_ID) > 1
+)
+SELECT
+    UUID_STRING(),
+    CONTROL_BATCH.BATCH_ID,
+    CONTROL_BATCH.SOURCE_NAME,
+    'SOURCE',
+    'BRONZE',
+    CONTROL_BATCH.SRC_ROW_COUNT,
+    COALESCE(BRONZE_COUNTS.CNT, 0),
+    IFF(CONTROL_BATCH.STATUS = 'QUARANTINED', CONTROL_BATCH.SRC_ROW_COUNT, 0),
+    0,
+    NULL,
+    NULL,
+    CASE
+        WHEN CONTROL_BATCH.BATCH_ID = CONTROL_BATCH.SRC_FILE_NM
+            THEN 'WARNING'
+        WHEN CONTROL_BATCH.SRC_ROW_COUNT <>
+            COALESCE(BRONZE_COUNTS.CNT, 0)
+            + IFF(CONTROL_BATCH.STATUS = 'QUARANTINED', CONTROL_BATCH.SRC_ROW_COUNT, 0)
+            THEN 'FAIL'
+        WHEN CONTROL_BATCH.STATUS = 'QUARANTINED'
+            AND CONTROL_BATCH.SRC_ROW_COUNT = 0
+            THEN 'WARNING'
+        WHEN DUPLICATE_BATCHES.SRC_FILE_NM IS NOT NULL
+            THEN 'WARNING'
+        ELSE 'PASS'
+    END,
+    'source=' || CONTROL_BATCH.SRC_ROW_COUNT
+        || ', bronze=' || COALESCE(BRONZE_COUNTS.CNT, 0)
+        || ', file_rejected=' || IFF(CONTROL_BATCH.STATUS = 'QUARANTINED', CONTROL_BATCH.SRC_ROW_COUNT, 0)
+        || ', duplicate_file=' || IFF(DUPLICATE_BATCHES.SRC_FILE_NM IS NOT NULL, 'TRUE', 'FALSE')
+        || ', legacy_batch_id=' || IFF(CONTROL_BATCH.BATCH_ID = CONTROL_BATCH.SRC_FILE_NM, 'TRUE', 'FALSE')
+        || ', status=' || CONTROL_BATCH.STATUS,
+    CURRENT_TIMESTAMP()
+FROM {{ snowflake_database }}.CONTROL.INGEST_BATCH AS CONTROL_BATCH
+LEFT JOIN BRONZE_COUNTS
+    ON BRONZE_COUNTS.BATCH_ID = CONTROL_BATCH.BATCH_ID
+    AND BRONZE_COUNTS.SOURCE_NAME = CONTROL_BATCH.SOURCE_NAME
+LEFT JOIN DUPLICATE_BATCHES
+    ON DUPLICATE_BATCHES.SRC_FILE_NM = CONTROL_BATCH.SRC_FILE_NM
+WHERE CONTROL_BATCH.SOURCE_NAME IN ('pos_sales', 'item_master', 'inventory', 'store_master')
+  AND REGEXP_LIKE(
+      CONTROL_BATCH.BATCH_ID,
+      '^[0-9]{8}_(pos_sales|item_master|inventory|store_master)_[0-9a-f]{16}$'
+  );
+
+INSERT INTO {{ snowflake_database }}.CONTROL.RECONCILIATION (
+    RECON_ID,
+    BATCH_ID,
+    SOURCE_NAME,
+    SOURCE_LAYER,
+    TARGET_LAYER,
+    SOURCE_RECORD_COUNT,
+    TARGET_RECORD_COUNT,
+    REJECTED_RECORD_COUNT,
+    DUPLICATE_RECORD_COUNT,
+    SOURCE_MEASURE_TOTAL,
+    TARGET_MEASURE_TOTAL,
+    RECON_STATUS,
+    RECON_MESSAGE,
+    RECON_TS
+)
+SELECT
+    UUID_STRING(),
+    'NO_CURRENT_BATCH',
+    'pipeline',
+    'SOURCE',
+    'BRONZE',
+    0,
+    0,
+    0,
+    0,
+    NULL,
+    NULL,
+    'FAIL',
+    'No date-scoped batch IDs found; rerun file discovery and Bronze loading.',
+    CURRENT_TIMESTAMP()
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM {{ snowflake_database }}.CONTROL.INGEST_BATCH
+    WHERE REGEXP_LIKE(
+        BATCH_ID,
+        '^[0-9]{8}_(pos_sales|item_master|inventory|store_master)_[0-9a-f]{16}$'
+    )
+);

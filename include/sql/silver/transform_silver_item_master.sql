@@ -1,0 +1,158 @@
+-- =====================================================
+-- SILVER ITEM MASTER TRANSFORMATION
+-- Bronze -> validate -> quarantine rejects -> merge valid
+-- Business key: ITEM_ID + SNAPSHOT_DATE (history preserved)
+-- =====================================================
+
+DELETE FROM {{ snowflake_database }}.QUARANTINE.RECORD_QUARANTINE
+WHERE SOURCE_NAME = 'item_master'
+  AND SOURCE_LAYER = 'BRONZE';
+
+INSERT INTO {{ snowflake_database }}.QUARANTINE.RECORD_QUARANTINE (
+    BATCH_ID,
+    SOURCE_NAME,
+    SOURCE_LAYER,
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    RAW_RECORD,
+    REASON_CODE,
+    REJECTION_REASON,
+    LOAD_DATE,
+    INGEST_TS,
+    QUARANTINE_TS
+)
+SELECT
+    BATCH_ID,
+    'item_master',
+    'BRONZE',
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    OBJECT_CONSTRUCT(
+        'item_id', ITEM_ID,
+        'item_name', ITEM_NAME,
+        'brand', BRAND,
+        'category', CATEGORY,
+        'subclass_id', SUBCLASS_ID,
+        'subclass_name', SUBCLASS_NAME,
+        'unit_cost', UNIT_COST,
+        'list_price', LIST_PRICE
+    ),
+    CASE
+        WHEN COALESCE(TRIM(ITEM_ID), '') = '' THEN 'MISSING_ITEM_ID'
+        WHEN COALESCE(TRIM(ITEM_NAME), '') = '' THEN 'MISSING_ITEM_NAME'
+        WHEN TRY_TO_NUMBER(UNIT_COST, 38, 6) IS NULL THEN 'INVALID_UNIT_COST'
+        WHEN TRY_TO_NUMBER(UNIT_COST, 38, 6) < 0 THEN 'NEGATIVE_UNIT_COST'
+        WHEN TRY_TO_NUMBER(LIST_PRICE, 38, 6) IS NULL THEN 'INVALID_LIST_PRICE'
+        WHEN TRY_TO_NUMBER(LIST_PRICE, 38, 6) < 0 THEN 'NEGATIVE_LIST_PRICE'
+        ELSE 'INVALID_ITEM_MASTER_ROW'
+    END,
+    RTRIM(CONCAT(
+        IFF(COALESCE(TRIM(ITEM_ID), '') = '', 'missing item id; ', ''),
+        IFF(COALESCE(TRIM(ITEM_NAME), '') = '', 'missing item name; ', ''),
+        IFF(TRY_TO_NUMBER(UNIT_COST, 38, 6) IS NULL, 'invalid unit cost; ', ''),
+        IFF(TRY_TO_NUMBER(UNIT_COST, 38, 6) < 0, 'negative unit cost; ', ''),
+        IFF(TRY_TO_NUMBER(LIST_PRICE, 38, 6) IS NULL, 'invalid list price; ', ''),
+        IFF(TRY_TO_NUMBER(LIST_PRICE, 38, 6) < 0, 'negative list price; ', '')
+    ), '; '),
+    COALESCE(
+        TRY_TO_DATE(REGEXP_SUBSTR(SRC_FILE_NM, '[0-9]{8}'), 'YYYYMMDD'),
+        INGEST_DT
+    ),
+    INGEST_TS,
+    CURRENT_TIMESTAMP()
+FROM {{ snowflake_database }}.BRONZE.BRONZE_ITEM_MASTER
+WHERE NOT (
+    COALESCE(TRIM(ITEM_ID), '') <> ''
+    AND COALESCE(TRIM(ITEM_NAME), '') <> ''
+    AND TRY_TO_NUMBER(UNIT_COST, 38, 6) >= 0
+    AND TRY_TO_NUMBER(LIST_PRICE, 38, 6) >= 0
+);
+
+-- Refresh silver from the current validated bronze contents.
+DELETE FROM {{ snowflake_database }}.SILVER.SILVER_ITEM_MASTER
+WHERE SNAPSHOT_DATE = TO_DATE(%s);
+
+MERGE INTO {{ snowflake_database }}.SILVER.SILVER_ITEM_MASTER AS TARGET
+USING (
+    SELECT
+        COALESCE(
+            TRY_TO_DATE(REGEXP_SUBSTR(SRC_FILE_NM, '[0-9]{8}'), 'YYYYMMDD'),
+            INGEST_DT
+        ) AS SNAPSHOT_DATE,
+        ITEM_ID,
+        ITEM_NAME,
+        BRAND,
+        CATEGORY,
+        SUBCLASS_ID,
+        SUBCLASS_NAME,
+        TRY_TO_NUMBER(UNIT_COST, 12, 2) AS UNIT_COST,
+        TRY_TO_NUMBER(LIST_PRICE, 12, 2) AS LIST_PRICE,
+        SRC_FILE_NM,
+        SRC_ROW_NUM,
+        INGEST_TS,
+        BATCH_ID
+    FROM {{ snowflake_database }}.BRONZE.BRONZE_ITEM_MASTER
+    WHERE
+        COALESCE(
+            TRY_TO_DATE(REGEXP_SUBSTR(SRC_FILE_NM, '[0-9]{8}'), 'YYYYMMDD'),
+            INGEST_DT
+        ) = TO_DATE(%s)
+        AND
+        COALESCE(TRIM(ITEM_ID), '') <> ''
+        AND COALESCE(TRIM(ITEM_NAME), '') <> ''
+        AND TRY_TO_NUMBER(UNIT_COST, 38, 6) >= 0
+        AND TRY_TO_NUMBER(LIST_PRICE, 38, 6) >= 0
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY ITEM_ID, SNAPSHOT_DATE
+        ORDER BY INGEST_TS DESC, SRC_ROW_NUM DESC
+    ) = 1
+) AS SOURCE
+ON TARGET.ITEM_ID = SOURCE.ITEM_ID
+    AND TARGET.SNAPSHOT_DATE = SOURCE.SNAPSHOT_DATE
+
+WHEN MATCHED THEN UPDATE SET
+    TARGET.ITEM_NAME = SOURCE.ITEM_NAME,
+    TARGET.BRAND = SOURCE.BRAND,
+    TARGET.CATEGORY = SOURCE.CATEGORY,
+    TARGET.SUBCLASS_ID = SOURCE.SUBCLASS_ID,
+    TARGET.SUBCLASS_NAME = SOURCE.SUBCLASS_NAME,
+    TARGET.UNIT_COST = SOURCE.UNIT_COST,
+    TARGET.LIST_PRICE = SOURCE.LIST_PRICE,
+    TARGET.SRC_FILE_NM = SOURCE.SRC_FILE_NM,
+    TARGET.SRC_ROW_NUM = SOURCE.SRC_ROW_NUM,
+    TARGET.INGEST_TS = SOURCE.INGEST_TS,
+    TARGET.BATCH_ID = SOURCE.BATCH_ID,
+    TARGET.UPDATED_TS = CURRENT_TIMESTAMP()
+
+WHEN NOT MATCHED THEN INSERT (
+    SNAPSHOT_DATE,
+    ITEM_ID,
+    ITEM_NAME,
+    BRAND,
+    CATEGORY,
+    SUBCLASS_ID,
+    SUBCLASS_NAME,
+    UNIT_COST,
+    LIST_PRICE,
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    INGEST_TS,
+    BATCH_ID,
+    CREATED_TS
+)
+VALUES (
+    SOURCE.SNAPSHOT_DATE,
+    SOURCE.ITEM_ID,
+    SOURCE.ITEM_NAME,
+    SOURCE.BRAND,
+    SOURCE.CATEGORY,
+    SOURCE.SUBCLASS_ID,
+    SOURCE.SUBCLASS_NAME,
+    SOURCE.UNIT_COST,
+    SOURCE.LIST_PRICE,
+    SOURCE.SRC_FILE_NM,
+    SOURCE.SRC_ROW_NUM,
+    SOURCE.INGEST_TS,
+    SOURCE.BATCH_ID,
+    CURRENT_TIMESTAMP()
+);

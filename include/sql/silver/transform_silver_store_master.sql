@@ -1,0 +1,154 @@
+-- =====================================================
+-- SILVER STORE MASTER TRANSFORMATION
+-- Bronze -> validate -> quarantine rejects -> merge valid
+-- Business key: STORE_ID + SNAPSHOT_DATE (history preserved)
+-- =====================================================
+
+DELETE FROM {{ snowflake_database }}.QUARANTINE.RECORD_QUARANTINE
+WHERE SOURCE_NAME = 'store_master'
+  AND SOURCE_LAYER = 'BRONZE';
+
+INSERT INTO {{ snowflake_database }}.QUARANTINE.RECORD_QUARANTINE (
+    BATCH_ID,
+    SOURCE_NAME,
+    SOURCE_LAYER,
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    RAW_RECORD,
+    REASON_CODE,
+    REJECTION_REASON,
+    LOAD_DATE,
+    INGEST_TS,
+    QUARANTINE_TS
+)
+SELECT
+    BATCH_ID,
+    'store_master',
+    'BRONZE',
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    OBJECT_CONSTRUCT(
+        'store_id', STORE_ID,
+        'store_name', STORE_NAME,
+        'city', CITY,
+        'district_id', DISTRICT_ID,
+        'district_name', DISTRICT_NAME,
+        'region', REGION,
+        'store_type', STORE_TYPE,
+        'open_date', OPEN_DATE
+    ),
+    CASE
+        WHEN COALESCE(TRIM(STORE_ID), '') = '' THEN 'MISSING_STORE_ID'
+        WHEN COALESCE(TRIM(STORE_NAME), '') = '' THEN 'MISSING_STORE_NAME'
+        WHEN COALESCE(TRIM(REGION), '') = '' THEN 'MISSING_REGION'
+        WHEN TRY_TO_DATE(OPEN_DATE) IS NULL THEN 'INVALID_OPEN_DATE'
+        ELSE 'INVALID_STORE_MASTER_ROW'
+    END,
+    RTRIM(CONCAT(
+        IFF(COALESCE(TRIM(STORE_ID), '') = '', 'missing store id; ', ''),
+        IFF(COALESCE(TRIM(STORE_NAME), '') = '', 'missing store name; ', ''),
+        IFF(COALESCE(TRIM(REGION), '') = '', 'missing region; ', ''),
+        IFF(TRY_TO_DATE(OPEN_DATE) IS NULL, 'invalid open date; ', '')
+    ), '; '),
+    COALESCE(
+        TRY_TO_DATE(REGEXP_SUBSTR(SRC_FILE_NM, '[0-9]{8}'), 'YYYYMMDD'),
+        INGEST_DT
+    ),
+    INGEST_TS,
+    CURRENT_TIMESTAMP()
+FROM {{ snowflake_database }}.BRONZE.BRONZE_STORE_MASTER
+WHERE NOT (
+    COALESCE(TRIM(STORE_ID), '') <> ''
+    AND COALESCE(TRIM(STORE_NAME), '') <> ''
+    AND COALESCE(TRIM(REGION), '') <> ''
+    AND TRY_TO_DATE(OPEN_DATE) IS NOT NULL
+);
+
+-- Refresh silver from the current validated bronze contents.
+DELETE FROM {{ snowflake_database }}.SILVER.SILVER_STORE_MASTER
+WHERE SNAPSHOT_DATE = TO_DATE(%s);
+
+MERGE INTO {{ snowflake_database }}.SILVER.SILVER_STORE_MASTER AS TARGET
+USING (
+    SELECT
+        COALESCE(
+            TRY_TO_DATE(REGEXP_SUBSTR(SRC_FILE_NM, '[0-9]{8}'), 'YYYYMMDD'),
+            INGEST_DT
+        ) AS SNAPSHOT_DATE,
+        STORE_ID,
+        STORE_NAME,
+        CITY,
+        DISTRICT_ID,
+        DISTRICT_NAME,
+        REGION,
+        STORE_TYPE,
+        TRY_TO_DATE(OPEN_DATE) AS OPEN_DATE,
+        SRC_FILE_NM,
+        SRC_ROW_NUM,
+        INGEST_TS,
+        BATCH_ID
+    FROM {{ snowflake_database }}.BRONZE.BRONZE_STORE_MASTER
+    WHERE
+        COALESCE(
+            TRY_TO_DATE(REGEXP_SUBSTR(SRC_FILE_NM, '[0-9]{8}'), 'YYYYMMDD'),
+            INGEST_DT
+        ) = TO_DATE(%s)
+        AND
+        COALESCE(TRIM(STORE_ID), '') <> ''
+        AND COALESCE(TRIM(STORE_NAME), '') <> ''
+        AND COALESCE(TRIM(REGION), '') <> ''
+        AND TRY_TO_DATE(OPEN_DATE) IS NOT NULL
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY STORE_ID, SNAPSHOT_DATE
+        ORDER BY INGEST_TS DESC, SRC_ROW_NUM DESC
+    ) = 1
+) AS SOURCE
+ON TARGET.STORE_ID = SOURCE.STORE_ID
+    AND TARGET.SNAPSHOT_DATE = SOURCE.SNAPSHOT_DATE
+
+WHEN MATCHED THEN UPDATE SET
+    TARGET.STORE_NAME = SOURCE.STORE_NAME,
+    TARGET.CITY = SOURCE.CITY,
+    TARGET.DISTRICT_ID = SOURCE.DISTRICT_ID,
+    TARGET.DISTRICT_NAME = SOURCE.DISTRICT_NAME,
+    TARGET.REGION = SOURCE.REGION,
+    TARGET.STORE_TYPE = SOURCE.STORE_TYPE,
+    TARGET.OPEN_DATE = SOURCE.OPEN_DATE,
+    TARGET.SRC_FILE_NM = SOURCE.SRC_FILE_NM,
+    TARGET.SRC_ROW_NUM = SOURCE.SRC_ROW_NUM,
+    TARGET.INGEST_TS = SOURCE.INGEST_TS,
+    TARGET.BATCH_ID = SOURCE.BATCH_ID,
+    TARGET.UPDATED_TS = CURRENT_TIMESTAMP()
+
+WHEN NOT MATCHED THEN INSERT (
+    SNAPSHOT_DATE,
+    STORE_ID,
+    STORE_NAME,
+    CITY,
+    DISTRICT_ID,
+    DISTRICT_NAME,
+    REGION,
+    STORE_TYPE,
+    OPEN_DATE,
+    SRC_FILE_NM,
+    SRC_ROW_NUM,
+    INGEST_TS,
+    BATCH_ID,
+    CREATED_TS
+)
+VALUES (
+    SOURCE.SNAPSHOT_DATE,
+    SOURCE.STORE_ID,
+    SOURCE.STORE_NAME,
+    SOURCE.CITY,
+    SOURCE.DISTRICT_ID,
+    SOURCE.DISTRICT_NAME,
+    SOURCE.REGION,
+    SOURCE.STORE_TYPE,
+    SOURCE.OPEN_DATE,
+    SOURCE.SRC_FILE_NM,
+    SOURCE.SRC_ROW_NUM,
+    SOURCE.INGEST_TS,
+    SOURCE.BATCH_ID,
+    CURRENT_TIMESTAMP()
+);
